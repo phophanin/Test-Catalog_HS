@@ -2,27 +2,30 @@ import { Product, Category, Brand, OrderLead, StoreSettings, FilterState, LeadSt
 import { initialProducts, initialCategories, initialBrands, initialOrderLeads, initialSettings } from './mock-data';
 import { supabase, isSupabaseConfigured } from '@/lib/supabase/client';
 
-// Local storage keys for offline/local mode persistence
+// ---------------------------------------------------------------------------
+// localStorage is used ONLY for:
+//   - language preference  (managed by LanguageContext)
+//   - currency preference  (managed by CurrencyContext)
+//   - order leads fallback (when Supabase is not configured — dev only)
+//   - store settings cache (when Supabase is not configured — dev only)
+//
+// Products, Categories, and Brands are NEVER stored in localStorage.
+// Supabase is the single source of truth for all product data.
+// ---------------------------------------------------------------------------
+
+// Minimal localStorage helpers — used only for leads & settings fallback
 const STORAGE_KEYS = {
-  PRODUCTS: 'home_sport_products_v1',
-  CATEGORIES: 'home_sport_categories_v1',
-  BRANDS: 'home_sport_brands_v1',
   LEADS: 'home_sport_leads_v1',
   SETTINGS: 'home_sport_settings_v1',
 };
 
-// Helper to get in-browser local storage or fallback to mock
 function getLocalItem<T>(key: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
   try {
     const item = localStorage.getItem(key);
-    if (!item) {
-      localStorage.setItem(key, JSON.stringify(fallback));
-      return fallback;
-    }
+    if (!item) return fallback;
     return JSON.parse(item) as T;
-  } catch (e) {
-    console.error('Error reading localStorage', e);
+  } catch {
     return fallback;
   }
 }
@@ -44,24 +47,25 @@ export async function getProducts(filters?: Partial<FilterState>): Promise<Produ
   let products: Product[] = [];
 
   if (isSupabaseConfigured && supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('products')
-        .select(`
-          *,
-          brand:brands(id, name, slug),
-          category:categories(id, name, slug)
-        `);
-      if (!error && data && data.length > 0) {
-        products = data as unknown as Product[];
-      } else {
-        products = getLocalItem<Product[]>(STORAGE_KEYS.PRODUCTS, initialProducts);
-      }
-    } catch {
-      products = getLocalItem<Product[]>(STORAGE_KEYS.PRODUCTS, initialProducts);
+    // Supabase is the ONLY source of truth — no localStorage fallback for products.
+    const { data, error } = await supabase
+      .from('products')
+      .select(`
+        *,
+        brand:brands(id, name, slug),
+        category:categories(id, name, slug)
+      `);
+    if (error) {
+      console.error('Supabase getProducts error:', error.message);
+      // Surface the error; return empty array so UI shows "no products" rather than stale data.
+      products = [];
+    } else {
+      products = (data ?? []) as unknown as Product[];
     }
   } else {
-    products = getLocalItem<Product[]>(STORAGE_KEYS.PRODUCTS, initialProducts);
+    // Local / dev mode — Supabase not configured. Use mock data in-memory only.
+    console.warn('[store] Supabase not configured — using mock data (dev mode only).');
+    products = initialProducts;
   }
 
   if (!filters) return products;
@@ -172,69 +176,115 @@ export async function getProducts(filters?: Partial<FilterState>): Promise<Produ
 }
 
 export async function getProductBySlug(slug: string): Promise<Product | null> {
-  const products = await getProducts();
-  const match = products.find((p) => p.slug.toLowerCase() === slug.toLowerCase());
-  return match || null;
+  if (isSupabaseConfigured && supabase) {
+    const { data, error } = await supabase
+      .from('products')
+      .select(`
+        *,
+        brand:brands(id, name, slug),
+        category:categories(id, name, slug)
+      `)
+      .eq('slug', slug.toLowerCase())
+      .single();
+    if (error || !data) return null;
+    return data as unknown as Product;
+  }
+  // Dev fallback
+  return initialProducts.find((p) => p.slug.toLowerCase() === slug.toLowerCase()) || null;
 }
 
 export async function getProductById(id: string): Promise<Product | null> {
-  const products = await getProducts();
-  const match = products.find((p) => p.id === id);
-  return match || null;
+  if (isSupabaseConfigured && supabase) {
+    const { data, error } = await supabase
+      .from('products')
+      .select(`
+        *,
+        brand:brands(id, name, slug),
+        category:categories(id, name, slug)
+      `)
+      .eq('id', id)
+      .single();
+    if (error || !data) return null;
+    return data as unknown as Product;
+  }
+  // Dev fallback
+  return initialProducts.find((p) => p.id === id) || null;
 }
 
 export async function createProduct(productData: Omit<Product, 'id' | 'created_at'>): Promise<Product> {
-  const newProduct: Product = {
-    ...productData,
-    id: `prod-${Date.now()}`,
-    created_at: new Date().toISOString(),
-  };
-
-  if (isSupabaseConfigured && supabase) {
-    try {
-      await supabase.from('products').insert([newProduct]);
-    } catch (e) {
-      console.error('Supabase product insert error', e);
-    }
+  if (!isSupabaseConfigured || !supabase) {
+    // Dev-only in-memory creation (no persistence across refreshes)
+    console.warn('[store] Supabase not configured — product created in memory only (dev mode).');
+    return {
+      ...productData,
+      id: `prod-${Date.now()}`,
+      created_at: new Date().toISOString(),
+    };
   }
 
-  const products = getLocalItem<Product[]>(STORAGE_KEYS.PRODUCTS, initialProducts);
-  const updated = [newProduct, ...products];
-  setLocalItem(STORAGE_KEYS.PRODUCTS, updated);
-  return newProduct;
+  const { data, error } = await supabase
+    .from('products')
+    .insert([{ ...productData }])
+    .select(`
+      *,
+      brand:brands(id, name, slug),
+      category:categories(id, name, slug)
+    `)
+    .single();
+
+  if (error || !data) {
+    console.error('Supabase createProduct error:', error?.message);
+    throw new Error(error?.message || 'Failed to create product in database.');
+  }
+
+  return data as unknown as Product;
 }
 
 export async function updateProduct(id: string, updates: Partial<Product>): Promise<Product | null> {
-  if (isSupabaseConfigured && supabase) {
-    try {
-      await supabase.from('products').update(updates).eq('id', id);
-    } catch (e) {
-      console.error('Supabase product update error', e);
-    }
+  if (!isSupabaseConfigured || !supabase) {
+    console.warn('[store] Supabase not configured — product update is in memory only (dev mode).');
+    return null;
   }
 
-  const products = getLocalItem<Product[]>(STORAGE_KEYS.PRODUCTS, initialProducts);
-  const index = products.findIndex((p) => p.id === id);
-  if (index === -1) return null;
+  // Strip out joined objects before sending to Supabase — it only wants flat columns
+  const { brand, category, ...flatUpdates } = updates as Product & { brand?: unknown; category?: unknown };
+  void brand; void category; // suppress unused-var warnings
 
-  const updatedProduct = { ...products[index], ...updates, updated_at: new Date().toISOString() };
-  products[index] = updatedProduct;
-  setLocalItem(STORAGE_KEYS.PRODUCTS, products);
-  return updatedProduct;
+  const { data, error } = await supabase
+    .from('products')
+    .update({ ...flatUpdates, updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .select(`
+      *,
+      brand:brands(id, name, slug),
+      category:categories(id, name, slug)
+    `)
+    .single();
+
+  if (error || !data) {
+    console.error('Supabase updateProduct error:', error?.message);
+    throw new Error(error?.message || 'Failed to update product in database.');
+  }
+
+  return data as unknown as Product;
 }
 
 export async function deleteProduct(id: string): Promise<boolean> {
-  if (isSupabaseConfigured && supabase) {
-    try {
-      await supabase.from('products').delete().eq('id', id);
-    } catch (e) {
-      console.error('Supabase product delete error', e);
-    }
+  if (!isSupabaseConfigured || !supabase) {
+    console.warn('[store] Supabase not configured — delete is in memory only (dev mode).');
+    return true;
   }
 
-  const products = getLocalItem<Product[]>(STORAGE_KEYS.PRODUCTS, initialProducts);
-  const filtered = products.filter((p) => p.id !== id);
-  setLocalItem(STORAGE_KEYS.PRODUCTS, filtered);
+  const { error } = await supabase
+    .from('products')
+    .delete()
+    .eq('id', id);
+
+  if (error) {
+    console.error('Supabase deleteProduct error:', error.message);
+    throw new Error(error.message || 'Failed to delete product from database.');
+  }
+
   return true;
 }
 
@@ -243,10 +293,26 @@ export async function deleteProduct(id: string): Promise<boolean> {
 // ==========================================
 
 export async function getCategories(): Promise<Category[]> {
-  const categories = getLocalItem<Category[]>(STORAGE_KEYS.CATEGORIES, initialCategories);
-  const products = await getProducts();
+  let categories: Category[] = [];
 
-  // Recalculate dynamic product counts
+  if (isSupabaseConfigured && supabase) {
+    const { data, error } = await supabase
+      .from('categories')
+      .select('*')
+      .order('name');
+    if (error) {
+      console.error('Supabase getCategories error:', error.message);
+      categories = [];
+    } else {
+      categories = (data ?? []) as Category[];
+    }
+  } else {
+    console.warn('[store] Supabase not configured — using mock categories (dev mode).');
+    categories = initialCategories;
+  }
+
+  // Recalculate product counts from live products
+  const products = await getProducts();
   return categories.map((cat) => {
     const count = products.filter((p) => {
       const slug = typeof p.category === 'object' && p.category ? p.category.slug : p.category_id;
@@ -257,35 +323,63 @@ export async function getCategories(): Promise<Category[]> {
 }
 
 export async function getCategoryBySlug(slug: string): Promise<Category | null> {
-  const categories = await getCategories();
-  return categories.find((c) => c.slug.toLowerCase() === slug.toLowerCase()) || null;
+  if (isSupabaseConfigured && supabase) {
+    const { data, error } = await supabase
+      .from('categories')
+      .select('*')
+      .eq('slug', slug.toLowerCase())
+      .single();
+    if (error || !data) return null;
+    return data as Category;
+  }
+  return initialCategories.find((c) => c.slug.toLowerCase() === slug.toLowerCase()) || null;
 }
 
 export async function createCategory(catData: Omit<Category, 'id'>): Promise<Category> {
-  const newCat: Category = {
-    ...catData,
-    id: `cat-${Date.now()}`,
-    product_count: 0,
-  };
-  const categories = getLocalItem<Category[]>(STORAGE_KEYS.CATEGORIES, initialCategories);
-  const updated = [...categories, newCat];
-  setLocalItem(STORAGE_KEYS.CATEGORIES, updated);
-  return newCat;
+  if (!isSupabaseConfigured || !supabase) {
+    console.warn('[store] Supabase not configured — category created in memory only (dev mode).');
+    return { ...catData, id: `cat-${Date.now()}`, product_count: 0 };
+  }
+
+  const { data, error } = await supabase
+    .from('categories')
+    .insert([{ ...catData, product_count: 0 }])
+    .select()
+    .single();
+
+  if (error || !data) {
+    throw new Error(error?.message || 'Failed to create category.');
+  }
+  return data as Category;
 }
 
 export async function updateCategory(id: string, updates: Partial<Category>): Promise<Category | null> {
-  const categories = getLocalItem<Category[]>(STORAGE_KEYS.CATEGORIES, initialCategories);
-  const index = categories.findIndex((c) => c.id === id);
-  if (index === -1) return null;
-  categories[index] = { ...categories[index], ...updates };
-  setLocalItem(STORAGE_KEYS.CATEGORIES, categories);
-  return categories[index];
+  if (!isSupabaseConfigured || !supabase) {
+    console.warn('[store] Supabase not configured — category update is in memory only (dev mode).');
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from('categories')
+    .update(updates)
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error || !data) {
+    throw new Error(error?.message || 'Failed to update category.');
+  }
+  return data as Category;
 }
 
 export async function deleteCategory(id: string): Promise<boolean> {
-  const categories = getLocalItem<Category[]>(STORAGE_KEYS.CATEGORIES, initialCategories);
-  const filtered = categories.filter((c) => c.id !== id);
-  setLocalItem(STORAGE_KEYS.CATEGORIES, filtered);
+  if (!isSupabaseConfigured || !supabase) {
+    console.warn('[store] Supabase not configured — delete is in memory only (dev mode).');
+    return true;
+  }
+
+  const { error } = await supabase.from('categories').delete().eq('id', id);
+  if (error) throw new Error(error.message || 'Failed to delete category.');
   return true;
 }
 
@@ -294,9 +388,26 @@ export async function deleteCategory(id: string): Promise<boolean> {
 // ==========================================
 
 export async function getBrands(): Promise<Brand[]> {
-  const brands = getLocalItem<Brand[]>(STORAGE_KEYS.BRANDS, initialBrands);
-  const products = await getProducts();
+  let brands: Brand[] = [];
 
+  if (isSupabaseConfigured && supabase) {
+    const { data, error } = await supabase
+      .from('brands')
+      .select('*')
+      .order('name');
+    if (error) {
+      console.error('Supabase getBrands error:', error.message);
+      brands = [];
+    } else {
+      brands = (data ?? []) as Brand[];
+    }
+  } else {
+    console.warn('[store] Supabase not configured — using mock brands (dev mode).');
+    brands = initialBrands;
+  }
+
+  // Recalculate product counts from live products
+  const products = await getProducts();
   return brands.map((b) => {
     const count = products.filter((p) => {
       const slug = typeof p.brand === 'object' && p.brand ? p.brand.slug : p.brand_id;
@@ -307,35 +418,63 @@ export async function getBrands(): Promise<Brand[]> {
 }
 
 export async function getBrandBySlug(slug: string): Promise<Brand | null> {
-  const brands = await getBrands();
-  return brands.find((b) => b.slug.toLowerCase() === slug.toLowerCase()) || null;
+  if (isSupabaseConfigured && supabase) {
+    const { data, error } = await supabase
+      .from('brands')
+      .select('*')
+      .eq('slug', slug.toLowerCase())
+      .single();
+    if (error || !data) return null;
+    return data as Brand;
+  }
+  return initialBrands.find((b) => b.slug.toLowerCase() === slug.toLowerCase()) || null;
 }
 
 export async function createBrand(brandData: Omit<Brand, 'id'>): Promise<Brand> {
-  const newBrand: Brand = {
-    ...brandData,
-    id: `brand-${Date.now()}`,
-    product_count: 0,
-  };
-  const brands = getLocalItem<Brand[]>(STORAGE_KEYS.BRANDS, initialBrands);
-  const updated = [...brands, newBrand];
-  setLocalItem(STORAGE_KEYS.BRANDS, updated);
-  return newBrand;
+  if (!isSupabaseConfigured || !supabase) {
+    console.warn('[store] Supabase not configured — brand created in memory only (dev mode).');
+    return { ...brandData, id: `brand-${Date.now()}`, product_count: 0 };
+  }
+
+  const { data, error } = await supabase
+    .from('brands')
+    .insert([{ ...brandData, product_count: 0 }])
+    .select()
+    .single();
+
+  if (error || !data) {
+    throw new Error(error?.message || 'Failed to create brand.');
+  }
+  return data as Brand;
 }
 
 export async function updateBrand(id: string, updates: Partial<Brand>): Promise<Brand | null> {
-  const brands = getLocalItem<Brand[]>(STORAGE_KEYS.BRANDS, initialBrands);
-  const index = brands.findIndex((b) => b.id === id);
-  if (index === -1) return null;
-  brands[index] = { ...brands[index], ...updates };
-  setLocalItem(STORAGE_KEYS.BRANDS, brands);
-  return brands[index];
+  if (!isSupabaseConfigured || !supabase) {
+    console.warn('[store] Supabase not configured — brand update is in memory only (dev mode).');
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from('brands')
+    .update(updates)
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error || !data) {
+    throw new Error(error?.message || 'Failed to update brand.');
+  }
+  return data as Brand;
 }
 
 export async function deleteBrand(id: string): Promise<boolean> {
-  const brands = getLocalItem<Brand[]>(STORAGE_KEYS.BRANDS, initialBrands);
-  const filtered = brands.filter((b) => b.id !== id);
-  setLocalItem(STORAGE_KEYS.BRANDS, filtered);
+  if (!isSupabaseConfigured || !supabase) {
+    console.warn('[store] Supabase not configured — delete is in memory only (dev mode).');
+    return true;
+  }
+
+  const { error } = await supabase.from('brands').delete().eq('id', id);
+  if (error) throw new Error(error.message || 'Failed to delete brand.');
   return true;
 }
 
@@ -345,17 +484,15 @@ export async function deleteBrand(id: string): Promise<boolean> {
 
 export async function getOrderLeads(): Promise<OrderLead[]> {
   if (isSupabaseConfigured && supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('order_leads')
-        .select('*')
-        .order('created_at', { ascending: false });
-      if (!error && data && data.length > 0) {
-        return data as OrderLead[];
-      }
-    } catch {
-      // Fallback
+    const { data, error } = await supabase
+      .from('order_leads')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) {
+      console.error('Supabase getOrderLeads error:', error.message);
+      return getLocalItem<OrderLead[]>(STORAGE_KEYS.LEADS, initialOrderLeads);
     }
+    return (data ?? []) as OrderLead[];
   }
   return getLocalItem<OrderLead[]>(STORAGE_KEYS.LEADS, initialOrderLeads);
 }
@@ -368,11 +505,14 @@ export async function createOrderLead(leadData: Omit<OrderLead, 'id' | 'created_
   };
 
   if (isSupabaseConfigured && supabase) {
-    try {
-      await supabase.from('order_leads').insert([newLead]);
-    } catch (e) {
-      console.error('Supabase lead insert error', e);
-    }
+    const { data, error } = await supabase
+      .from('order_leads')
+      .insert([newLead])
+      .select()
+      .single();
+    if (!error && data) return data as OrderLead;
+    console.error('Supabase createOrderLead error:', error?.message);
+    // Fall through to localStorage backup so customer order is not lost
   }
 
   const leads = getLocalItem<OrderLead[]>(STORAGE_KEYS.LEADS, initialOrderLeads);
@@ -383,11 +523,12 @@ export async function createOrderLead(leadData: Omit<OrderLead, 'id' | 'created_
 
 export async function updateLeadStatus(id: string, status: LeadStatus): Promise<boolean> {
   if (isSupabaseConfigured && supabase) {
-    try {
-      await supabase.from('order_leads').update({ status }).eq('id', id);
-    } catch (e) {
-      console.error('Supabase lead update error', e);
+    const { error } = await supabase.from('order_leads').update({ status }).eq('id', id);
+    if (error) {
+      console.error('Supabase updateLeadStatus error:', error.message);
+      return false;
     }
+    return true;
   }
 
   const leads = getLocalItem<OrderLead[]>(STORAGE_KEYS.LEADS, initialOrderLeads);
@@ -406,18 +547,13 @@ export async function updateLeadStatus(id: string, status: LeadStatus): Promise<
 
 export async function getStoreSettings(): Promise<StoreSettings> {
   if (isSupabaseConfigured && supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('store_settings')
-        .select('*')
-        .eq('id', 'default')
-        .single();
-      if (!error && data) {
-        return data as StoreSettings;
-      }
-    } catch {
-      // Fallback
-    }
+    const { data, error } = await supabase
+      .from('store_settings')
+      .select('*')
+      .eq('id', 'default')
+      .single();
+    if (!error && data) return data as StoreSettings;
+    console.error('Supabase getStoreSettings error:', error?.message);
   }
   return getLocalItem<StoreSettings>(STORAGE_KEYS.SETTINGS, initialSettings);
 }
@@ -427,11 +563,12 @@ export async function updateStoreSettings(updates: Partial<StoreSettings>): Prom
   const updated = { ...current, ...updates };
 
   if (isSupabaseConfigured && supabase) {
-    try {
-      await supabase.from('store_settings').upsert(updated);
-    } catch (e) {
-      console.error('Supabase settings update error', e);
+    const { error } = await supabase.from('store_settings').upsert(updated);
+    if (error) {
+      console.error('Supabase updateStoreSettings error:', error.message);
+      throw new Error(error.message || 'Failed to save settings.');
     }
+    return updated;
   }
 
   setLocalItem(STORAGE_KEYS.SETTINGS, updated);

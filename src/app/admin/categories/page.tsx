@@ -84,8 +84,13 @@ export default function AdminCategoriesPage() {
 
   const handleDelete = async (id: string, catName: string) => {
     if (confirm(`Delete category "${catName}"?`)) {
-      await deleteCategory(id);
-      loadData();
+      try {
+        await deleteCategory(id);
+        await loadData();
+      } catch (err) {
+        console.error('Delete category error:', err);
+        alert(`Failed to delete category: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      }
     }
   };
 

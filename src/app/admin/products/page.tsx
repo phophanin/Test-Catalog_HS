@@ -46,8 +46,13 @@ export default function AdminProductsPage() {
 
   const handleDelete = async (id: string, name: string) => {
     if (confirm(`Are you sure you want to delete "${name}"? This action cannot be undone.`)) {
-      await deleteProduct(id);
-      loadData();
+      try {
+        await deleteProduct(id);
+        await loadData();
+      } catch (err) {
+        console.error('Delete product error:', err);
+        alert(`Failed to delete product: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      }
     }
   };
 

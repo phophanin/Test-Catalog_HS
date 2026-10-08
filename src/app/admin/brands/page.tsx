@@ -89,8 +89,13 @@ export default function AdminBrandsPage() {
 
   const handleDelete = async (id: string, brandName: string) => {
     if (confirm(`Delete brand "${brandName}"?`)) {
-      await deleteBrand(id);
-      loadData();
+      try {
+        await deleteBrand(id);
+        await loadData();
+      } catch (err) {
+        console.error('Delete brand error:', err);
+        alert(`Failed to delete brand: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      }
     }
   };
 
